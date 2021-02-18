@@ -9,6 +9,7 @@ from django.utils import timezone
 from django_prometheus.models import model_deletes, model_inserts, model_updates
 from prometheus_client import Counter
 
+from utilities.utils import shallow_compare_dict
 from .choices import ObjectChangeActionChoices
 from .models import CustomField, ObjectChange
 from .webhooks import enqueue_webhooks
@@ -17,6 +18,27 @@ from .webhooks import enqueue_webhooks
 #
 # Change logging/webhooks
 #
+
+def _is_object_changed(request, objectchange):
+    objectchanges = ObjectChange.objects.restrict(request.user, 'view').filter(
+        changed_object_type=objectchange.changed_object_type,
+        changed_object_id=objectchange.changed_object_id,
+    )
+
+    prev_change = objectchanges.filter(time__lt=timezone.now()).order_by('-time').first()
+
+    if prev_change:
+        diff_added = shallow_compare_dict(
+            prev_change.object_data,
+            objectchange.object_data,
+            exclude=['last_updated'],
+        )
+        diff_removed = {x: prev_change.object_data.get(x) for x in diff_added}
+    else:
+        # No previous change; this is the initial change that added the object
+        diff_added = diff_removed = objectchange.object_data
+
+    return diff_removed or diff_added
 
 def _handle_changed_object(request, sender, instance, **kwargs):
     """
@@ -36,9 +58,11 @@ def _handle_changed_object(request, sender, instance, **kwargs):
     # Record an ObjectChange if applicable
     if hasattr(instance, 'to_objectchange'):
         objectchange = instance.to_objectchange(action)
-        objectchange.user = request.user
-        objectchange.request_id = request.id
-        objectchange.save()
+
+        if _is_object_changed(request, objectchange):
+            objectchange.user = request.user
+            objectchange.request_id = request.id
+            objectchange.save()
 
     # Enqueue webhooks
     enqueue_webhooks(instance, request.user, request.id, action)
